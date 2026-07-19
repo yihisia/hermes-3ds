@@ -8,16 +8,26 @@
 #include <string.h>
 #include "audio.h"
 
-#define SAMPLE_RATE 16000
-#define SAMPLES_PER_FRAME (SAMPLE_RATE / 50) // 50fps = 320 samples/frame
+#define SAMPLE_RATE 16360
+#define SAMPLES_PER_FRAME 327
 
 static bool g_audio_initialized = false;
+static u8* g_mic_buffer = NULL;
+static u32 g_mic_buffer_size = 0;
 
 int audio_init(void) {
-    Result ret = micInit();
+    // Allocate microphone buffer (2 seconds at 16kHz, 16-bit mono)
+    g_mic_buffer_size = SAMPLE_RATE * 2 * 2; // 2 seconds, 16-bit
+    g_mic_buffer = linearAlloc(g_mic_buffer_size);
+    if (!g_mic_buffer) return -1;
+    
+    Result ret = micInit(SAMPLE_RATE, SAMPLES_PER_FRAME);
     if (R_FAILED(ret)) {
+        linearFree(g_mic_buffer);
+        g_mic_buffer = NULL;
         return -1;
     }
+    
     g_audio_initialized = true;
     return 0;
 }
@@ -25,97 +35,89 @@ int audio_init(void) {
 void audio_exit(void) {
     if (g_audio_initialized) {
         micExit();
+        if (g_mic_buffer) {
+            linearFree(g_mic_buffer);
+            g_mic_buffer = NULL;
+        }
         g_audio_initialized = false;
     }
 }
 
 int audio_record(u8* buffer, int buffer_size, int max_seconds) {
-    if (!g_audio_initialized) return -1;
+    if (!g_audio_initialized || !g_mic_buffer) return -1;
     
-    u32 sample_pos = 0;
     u32 total_samples = SAMPLE_RATE * max_seconds;
+    u32 total_bytes = 0;
+    u32 read_pos = 0;
     
-    // Start mic
-    MICU_SetPower(true);
-    MICU_SetGain(3); // Medium-high gain
+    // Start recording
+    Result ret = micStartRecording(g_mic_buffer, g_mic_buffer_size, SAMPLE_RATE, 0, 0, NULL);
+    if (R_FAILED(ret)) return -2;
     
-    // Configure sampling
-    u32 buf_size = SAMPLES_PER_FRAME * 2 * 4; // 16-bit, 4 frames buffer
-    u32* mic_buf = linearAlloc(buf_size);
-    if (!mic_buf) return -2;
+    int silence_count = 0;
+    bool has_audio = false;
     
-    Result ret = MICU_StartSampling(
-        MICU_SAMPLE_RATE_16384, // Closest to 16kHz
-        MICU_MONO,
-        0, // offset
-        SAMPLES_PER_FRAME * 2 * 4,
-        false // loop
-    );
-    
-    if (R_FAILED(ret)) {
-        linearFree(mic_buf);
-        return -3;
-    }
-    
-    int total_bytes = 0;
-    int silence_frames = 0;
-    bool started = false;
-    
-    while (total_bytes < buffer_size && (total_bytes / 2) < (int)total_samples) {
+    while (total_bytes < (u32)buffer_size && total_bytes < total_samples * 2) {
+        svcSleepThread(20000000ULL); // 20ms
+        
         // Check if user pressed B to stop
         hidScanInput();
         u32 kDown = hidKeysDown();
-        if (kDown & KEY_B && started) break;
+        if (kDown & KEY_B && has_audio) break;
         
-        // Wait for audio data
-        svcSleepThread(20000000ULL); // 20ms
+        // Get current write position
+        u32 write_pos = micGetSamplePos();
         
-        u32 samples_read;
-        ret = MICU_Read((void*)mic_buf, buf_size, &samples_read);
+        // Calculate how much new data is available
+        u32 available;
+        if (write_pos >= read_pos) {
+            available = write_pos - read_pos;
+        } else {
+            available = g_mic_buffer_size - read_pos + write_pos;
+        }
         
-        if (R_SUCCEEDED(ret) && samples_read > 0) {
-            // Copy samples to output buffer
-            int bytes_to_copy = samples_read * 2; // 16-bit samples
-            if (total_bytes + bytes_to_copy > buffer_size) {
+        if (available > 0) {
+            // Copy samples
+            u32 bytes_to_copy = available * 2; // 16-bit samples
+            if (total_bytes + bytes_to_copy > (u32)buffer_size) {
                 bytes_to_copy = buffer_size - total_bytes;
             }
             
-            // Convert from mic buffer (might be interleaved differently)
-            u16* src = (u16*)mic_buf;
-            int num_samples = samples_read;
+            // Copy with wrap-around handling
+            u32 first_chunk = g_mic_buffer_size - read_pos;
+            if (first_chunk > available * 2) first_chunk = available * 2;
             
-            for (int i = 0; i < num_samples && total_bytes + 2 <= buffer_size; i++) {
-                s16 sample = (s16)src[i];
-                
-                // Simple voice activity detection
-                if (sample > 500 || sample < -500) {
-                    started = true;
-                    silence_frames = 0;
-                } else if (started) {
-                    silence_frames++;
-                }
-                
-                // Stop after 1 second of silence
-                if (silence_frames > 50) break;
-                
-                // Write sample (little-endian 16-bit)
-                buffer[total_bytes] = sample & 0xFF;
-                buffer[total_bytes + 1] = (sample >> 8) & 0xFF;
-                total_bytes += 2;
+            memcpy(buffer + total_bytes, g_mic_buffer + read_pos, first_chunk);
+            total_bytes += first_chunk;
+            read_pos = (read_pos + first_chunk) % g_mic_buffer_size;
+            
+            if (first_chunk < bytes_to_copy) {
+                u32 second_chunk = bytes_to_copy - first_chunk;
+                memcpy(buffer + total_bytes, g_mic_buffer, second_chunk);
+                total_bytes += second_chunk;
+                read_pos = second_chunk;
             }
             
-            if (silence_frames > 50) break;
+            // Simple voice activity detection
+            s16* samples = (s16*)(buffer + total_bytes - bytes_to_copy);
+            for (u32 i = 0; i < bytes_to_copy / 2; i++) {
+                if (samples[i] > 500 || samples[i] < -500) {
+                    has_audio = true;
+                    silence_count = 0;
+                    break;
+                }
+            }
+            
+            if (has_audio) {
+                silence_count++;
+                if (silence_count > 50) break; // 1 second of silence
+            }
         }
         
-        // Yield to system
         gspWaitForVBlank();
     }
     
-    // Stop sampling
-    MICU_StopSampling();
-    MICU_SetPower(false);
-    
-    linearFree(mic_buf);
+    micStopRecording();
     
     return total_bytes;
 }
